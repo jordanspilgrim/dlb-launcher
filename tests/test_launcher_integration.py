@@ -146,8 +146,9 @@ def test_wake_injection_reaches_child_stdin(
         _ = _read_for(captured_r, 0.2)
 
         # Post the message AFTER the launcher's initial watermark snapshot
-        # so it counts as "new" — pre-existing messages are deliberately
-        # ignored by the watcher (those are the LLM's SessionStart problem).
+        # so it counts as "new" — exercises the watcher-thread poll path.
+        # The startup-surface path (pre-existing mail surfaced on launch) is
+        # covered by test_startup_surface_emits_existing_unread.
         insert_message(fake_dlb_store, recipient="alpha", sender="bravo", body="ping")
 
         # The watcher polls every 1.5s; the idle gate is 1s; allow a
@@ -169,3 +170,108 @@ def test_wake_injection_reaches_child_stdin(
 # launcher.py (the watcher thread is only spawned inside `if name:`); a
 # unit test on the launcher would need process isolation (pytest-forked
 # or similar). Skipping for v1 — covered by code inspection.
+
+
+def test_startup_surface_emits_existing_unread(fake_dlb_store: Path) -> None:
+    """Mail that arrived BEFORE the launcher started must produce a wake
+    prompt on launch (covers the gap between SessionStart hook fire and
+    the watcher's initial baseline snapshot).
+
+    This re-implements the launcher_in_thread fixture inline so we can
+    control the ordering: insert THEN launch (the fixture launches
+    immediately and there's no way to interpose).
+    """
+    # Insert FIRST — these are "pre-existing" from the launcher's POV.
+    insert_message(fake_dlb_store, recipient="alpha", sender="early-bird", body="hello")
+
+    captured_r, captured_w = os.pipe()
+    stdin_r, stdin_w = os.pipe()
+
+    saved_stdin = sys.stdin
+    saved_stdout = sys.stdout
+
+    sys.stdin = os.fdopen(stdin_r, "r")
+    sys.stdout = os.fdopen(captured_w, "w", buffering=1)
+
+    errors: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            run(cli_argv=[sys.executable, "-u", "-c", ECHO_CHILD], name="alpha")
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(captured_w)
+
+    t = Thread(target=target, daemon=True)
+    t.start()
+    try:
+        time.sleep(0.5)
+        if errors:
+            raise AssertionError(f"Launcher thread crashed: {errors[0]!r}") from errors[0]
+        # Read for up to 3s — startup-surface should fire essentially immediately
+        # (no poll interval to wait through; it's pre-watcher).
+        out = _read_for(captured_r, 3.0)
+        assert b"DLB-WAKE" in out, (
+            "Expected startup-surface to wake on pre-existing mail; got " + repr(out[:200])
+        )
+        assert b"[alpha]" in out
+        assert b"early-bird" in out
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(stdin_w)
+        t.join(timeout=3.0)
+        sys.stdin = saved_stdin
+        sys.stdout = saved_stdout
+        with contextlib.suppress(OSError):
+            os.close(captured_r)
+
+
+def test_startup_surface_silent_when_no_unread(fake_dlb_store: Path) -> None:
+    """No pre-existing mail → no startup-surface wake. The watcher's normal
+    poll path takes over once a real message arrives.
+
+    Asserted by checking that within a short window after launch (BEFORE
+    we insert anything), nothing matching DLB-WAKE appears on the relay.
+    """
+    captured_r, captured_w = os.pipe()
+    stdin_r, stdin_w = os.pipe()
+
+    saved_stdin = sys.stdin
+    saved_stdout = sys.stdout
+
+    sys.stdin = os.fdopen(stdin_r, "r")
+    sys.stdout = os.fdopen(captured_w, "w", buffering=1)
+
+    errors: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            run(cli_argv=[sys.executable, "-u", "-c", ECHO_CHILD], name="alpha")
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(captured_w)
+
+    t = Thread(target=target, daemon=True)
+    t.start()
+    try:
+        time.sleep(0.5)
+        if errors:
+            raise AssertionError(f"Launcher thread crashed: {errors[0]!r}") from errors[0]
+        # Short window (well under the watcher's 1.5s poll interval) so we
+        # don't accidentally catch a poll-cycle wake.
+        out = _read_for(captured_r, 1.0)
+        assert b"DLB-WAKE" not in out, (
+            "Did not expect a startup-surface wake when inbox is empty; got " + repr(out[:200])
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(stdin_w)
+        t.join(timeout=3.0)
+        sys.stdin = saved_stdin
+        sys.stdout = saved_stdout
+        with contextlib.suppress(OSError):
+            os.close(captured_r)

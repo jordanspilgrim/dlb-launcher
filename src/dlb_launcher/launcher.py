@@ -175,6 +175,27 @@ def run(cli_argv: list[str], name: str | None) -> int:
     stop = Event()
     watcher_thread: Thread | None = None
     if name:
+        # Startup-surface: if there are pre-existing unread messages when the
+        # launcher starts, inject ONE wake prompt now (then baseline). This
+        # closes the gap between the SessionStart hook firing (which tells
+        # the LLM "you have unread mail" if it's registered) and the
+        # watcher's baseline (which would otherwise skip pre-existing mail
+        # entirely). Without this, mail that arrived between hook-fire and
+        # launcher-start is invisible to the launcher AND to any LLM that
+        # wasn't registered at hook time.
+        try:
+            pre_count, pre_senders = watcher.unread_summary_for(name)
+            if pre_count > 0:
+                prompt = wake.compose_wake_prompt(name, pre_count, pre_senders)
+                # PTY not ready yet? Should be — pty.fork() returned. Worst
+                # case the LLM misses this one wake and the watcher picks up
+                # the NEXT message normally.
+                with contextlib.suppress(OSError):
+                    os.write(master_fd, prompt.encode())
+        except Exception:
+            # A watcher hiccup at startup must not block the launcher.
+            pass
+
         watcher_thread = Thread(
             target=_watcher_loop,
             args=(name, master_fd, idle, stop),
