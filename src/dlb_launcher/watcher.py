@@ -7,7 +7,13 @@ needing to stand up a PTY.
 The watcher does NOT inject anything itself — it just answers the question
 "are there new messages for <name> since the last time I checked?" The
 launcher process owns the PTY and is responsible for timing the injection
-(see idle.py).
+(see launcher.py).
+
+Schema compat: dlb-mcp 0.1.x stored timestamps as TEXT ISO strings; 0.2.0+
+uses INTEGER epoch-ms in `*_ms` columns. The watcher probes table_info on
+every call (one PRAGMA, instant) and queries whichever shape is present,
+so a launcher install works against either DLB version with no version
+pinning.
 """
 
 from __future__ import annotations
@@ -22,6 +28,22 @@ DEFAULT_STORE_PATH = Path.home() / ".dlb" / "store.sqlite3"
 def store_path() -> Path:
     """Resolve the DLB SQLite store path, honouring the same env var DLB uses."""
     return Path(os.environ.get("DLB_STORE", str(DEFAULT_STORE_PATH))).expanduser()
+
+
+def _detect_schema(conn: sqlite3.Connection) -> str:
+    """Return 'v2' if the messages table has the *_ms columns, else 'v1'.
+
+    Used by every query to pick the right column names. If the messages
+    table is missing entirely (DLB never initialized), returns 'v2' as a
+    benign default — the queries below all tolerate no-rows gracefully.
+    """
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    except sqlite3.Error:
+        return "v2"
+    if "sent_at_ms" in cols:
+        return "v2"
+    return "v1"
 
 
 def max_message_id_for(name: str, *, db: Path | None = None) -> int:
@@ -66,14 +88,25 @@ def unread_summary_for(name: str, *, db: Path | None = None) -> tuple[int, list[
     try:
         conn = sqlite3.connect(str(p), timeout=2.0)
         try:
-            rows = conn.execute(
-                """
-                SELECT sender_name FROM messages
-                WHERE recipient_name = ? AND read_at IS NULL
-                ORDER BY sent_at ASC
-                """,
-                (name,),
-            ).fetchall()
+            schema = _detect_schema(conn)
+            if schema == "v2":
+                rows = conn.execute(
+                    """
+                    SELECT sender_name FROM messages
+                    WHERE recipient_name = ? AND read_at_ms IS NULL
+                    ORDER BY sent_at_ms ASC
+                    """,
+                    (name,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT sender_name FROM messages
+                    WHERE recipient_name = ? AND read_at IS NULL
+                    ORDER BY sent_at ASC
+                    """,
+                    (name,),
+                ).fetchall()
             senders = [r[0] for r in rows]
             return (len(senders), senders)
         finally:
