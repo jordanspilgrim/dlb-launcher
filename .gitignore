@@ -22,3 +22,11 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# secrets (added during public-prep)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
