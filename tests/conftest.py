@@ -86,6 +86,95 @@ def fake_dlb_store_v2(fake_dlb_store: Path) -> Path:
     return fake_dlb_store
 
 
+V9_SCHEMA = """
+CREATE TABLE IF NOT EXISTS agents (
+    name                  TEXT PRIMARY KEY,
+    working_on            TEXT,
+    registered_at_ms      INTEGER NOT NULL,
+    last_seen_ms          INTEGER NOT NULL,
+    session_token         TEXT NOT NULL,
+    session_id            TEXT,
+    monitor_heartbeat_ms  INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipient_name   TEXT NOT NULL,
+    sender_name      TEXT NOT NULL,
+    subject          TEXT,
+    body             TEXT NOT NULL,
+    sent_at_ms       INTEGER NOT NULL,
+    read_at_ms       INTEGER,
+    expires_at_ms    INTEGER,
+    msg_type         TEXT,
+    cancelled_at_ms  INTEGER,
+    deadline_ms      INTEGER
+);
+"""
+
+
+@pytest.fixture()
+def fake_dlb_store_v9(fake_dlb_store: Path) -> Path:
+    """Rebuild the (auto-created) v1 store with dlb-mcp schema v9 columns."""
+    fake_dlb_store.unlink()
+    conn = sqlite3.connect(str(fake_dlb_store))
+    try:
+        conn.executescript(V9_SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+    return fake_dlb_store
+
+
+def insert_message_v9(
+    store: Path,
+    *,
+    recipient: str,
+    sender: str = "tester",
+    body: str = "hello",
+    read: bool = False,
+    msg_type: str | None = None,
+    cancelled: bool = False,
+    deadline_ms: int | None = None,
+    expires_at_ms: int | None = 4070908800000,
+) -> int:
+    """v9-shape variant with lifecycle columns."""
+    conn = sqlite3.connect(str(store))
+    try:
+        cur = conn.execute(
+            "INSERT INTO messages (recipient_name, sender_name, subject, body, "
+            "sent_at_ms, read_at_ms, expires_at_ms, msg_type, cancelled_at_ms, deadline_ms) "
+            "VALUES (?, ?, NULL, ?, 1767225600000, ?, ?, ?, ?, ?)",
+            (
+                recipient,
+                sender,
+                body,
+                1767225600000 if read else None,
+                expires_at_ms,
+                msg_type,
+                1767225600000 if cancelled else None,
+                deadline_ms,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def insert_agent_v9(store: Path, name: str) -> None:
+    conn = sqlite3.connect(str(store))
+    try:
+        conn.execute(
+            "INSERT INTO agents (name, registered_at_ms, last_seen_ms, session_token) "
+            "VALUES (?, 1767225600000, 1767225600000, 'tok')",
+            (name,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def insert_message(
     store: Path,
     *,

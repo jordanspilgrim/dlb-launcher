@@ -38,6 +38,13 @@ from . import wake, watcher
 # cost of a SELECT MAX(id) at one-per-1500ms, which is rounding-error.
 POLL_INTERVAL_S = 1.5
 
+# How often to retry injection while a batch waits for the child to go idle.
+PENDING_RETRY_S = 0.2
+
+# How often to stamp agents.monitor_heartbeat_ms. Well inside dlb-mcp's
+# default 120s wake window, so the session never flickers to unwakeable.
+HEARTBEAT_INTERVAL_S = 30.0
+
 
 def _set_window_size(fd: int) -> None:
     """Forward the user's terminal size to the child's PTY.
@@ -67,62 +74,69 @@ def _watcher_loop(
     BEFORE the launcher started don't trigger a wake (those are the LLM's
     SessionStart-hook problem, not the launcher's). We only fire on new
     arrivals while the launcher is running.
+
+    A batch that lands while the child is busy stays pending: the
+    watermark only advances once the wake prompt is written, so a long
+    turn delays the wake instead of dropping it. The loop also stamps a
+    monitor heartbeat at start and every HEARTBEAT_INTERVAL_S, so
+    dlb-mcp's list_threads reports this session as wakeable.
     """
     seen_max_id = watcher.max_message_id_for(name)
+    last_hb = 0.0
     _debug = os.environ.get("DLB_LAUNCHER_DEBUG") == "1"
     if _debug:
         sys.stderr.write(f"[dlb-launcher] watcher start, baseline id={seen_max_id}\n")
     while not stop.is_set():
+        pending = False
         try:
+            # Heartbeat first (and immediately at start) so list_threads
+            # shows this session as wakeable while the launcher runs.
+            now = time.time()
+            if now - last_hb >= HEARTBEAT_INTERVAL_S:
+                watcher.record_heartbeat(name)
+                last_hb = now
             current_max = watcher.max_message_id_for(name)
             if _debug:
                 sys.stderr.write(
                     f"[dlb-launcher] poll: current_max={current_max} seen={seen_max_id}\n"
                 )
             if current_max > seen_max_id:
-                # New messages — but only inject when child is idle, to
+                # New work — but only inject when the child is idle, to
                 # avoid splatting our prompt into the middle of streaming
-                # output. We spin here (with short sleeps) until idle, then
-                # inject. If the child stays busy for >30s we give up on
-                # this batch and let the next poll re-detect.
-                give_up_at = time.time() + 30.0
-                while not stop.is_set() and time.time() < give_up_at:
-                    if idle.is_idle():
-                        count, senders = watcher.unread_summary_for(name)
-                        if _debug:
-                            sys.stderr.write(
-                                f"[dlb-launcher] injecting wake: count={count} senders={senders}\n"
-                            )
-                        if count > 0:
-                            prompt = wake.compose_wake_prompt(name, count, senders)
-                            try:
-                                os.write(master_fd, prompt.encode())
-                                if _debug:
-                                    sys.stderr.write(
-                                        f"[dlb-launcher] wrote {len(prompt)} bytes to master\n"
-                                    )
-                            except OSError as e:
-                                if _debug:
-                                    sys.stderr.write(f"[dlb-launcher] write failed: {e}\n")
-                                # Child PTY gone — parent IO loop will
-                                # also notice; bail out.
-                                return
-                        seen_max_id = current_max
-                        break
-                    elif _debug:
-                        sys.stderr.write("[dlb-launcher] not idle yet, waiting...\n")
-                    time.sleep(0.2)
-                else:
-                    # Child stayed busy too long; advance watermark anyway
-                    # so we don't keep re-checking the same batch forever.
-                    # Next message arrival will re-trigger.
+                # output. While it stays busy the batch stays pending (the
+                # watermark does not move) and we re-check on a short
+                # interval, however long the child's turn runs.
+                if idle.is_idle():
+                    count, senders = watcher.unread_summary_for(name)
+                    if _debug:
+                        sys.stderr.write(
+                            f"[dlb-launcher] injecting wake: count={count} senders={senders}\n"
+                        )
+                    if count > 0:
+                        prompt = wake.compose_wake_prompt(name, count, senders)
+                        try:
+                            os.write(master_fd, prompt.encode())
+                            if _debug:
+                                sys.stderr.write(
+                                    f"[dlb-launcher] wrote {len(prompt)} bytes to master\n"
+                                )
+                        except OSError as e:
+                            if _debug:
+                                sys.stderr.write(f"[dlb-launcher] write failed: {e}\n")
+                            # Child PTY gone — parent IO loop will also
+                            # notice; bail out.
+                            return
                     seen_max_id = current_max
+                else:
+                    pending = True
+                    if _debug:
+                        sys.stderr.write("[dlb-launcher] not idle yet, batch pending\n")
         except Exception:
             # Watcher must never crash the launcher; swallow and continue.
             pass
-        # Block on the stop event for the poll interval so shutdown is
-        # responsive (vs. sleeping in a way the parent can't interrupt).
-        stop.wait(POLL_INTERVAL_S)
+        # Block on the stop event so shutdown is responsive (vs. sleeping in
+        # a way the parent can't interrupt).
+        stop.wait(PENDING_RETRY_S if pending else POLL_INTERVAL_S)
 
 
 def run(cli_argv: list[str], name: str | None) -> int:

@@ -50,6 +50,12 @@ Then, inside each session, tell the LLM to register with DLB using the **same na
 
 From this point on, when alpha sends a message to bravo (via `mcp__dlb__send`), `dlb-launcher` in bravo's terminal sees the new mail, waits for bravo to be idle, and injects a synthetic prompt. Bravo's LLM reads the inbox and processes the message. Replies travel the same path in reverse.
 
+What wakes the session, and what doesn't:
+
+- **Work only.** Read receipts, cancelled or superseded tasks, and messages past their deadline or expiry never wake the CLI (dlb-mcp schema v9+). On older stores every new message counts, as before.
+- **Busy means later, not never.** If mail lands mid-turn, the batch stays pending and the wake fires as soon as the CLI goes idle, however long the turn runs.
+- **Heartbeat.** While running, the launcher stamps `monitor_heartbeat_ms` for its name every 30s, so `list_threads` shows the session as `wakeable`. It only updates an existing agent row; it never creates the store or registers a name.
+
 ## How the wake prompt looks
 
 When mail arrives, the wrapped CLI sees this as if you typed it:
@@ -76,7 +82,7 @@ Env vars:
 ## Setup notes per CLI
 
 ### Claude Code
-Already-configured DLB MCP entry in `~/.claude.json`? You're ready. The `~/.claude/hooks/dlb-inbox-check.sh` hook (if installed) gives you a secondary belt-and-suspenders notification on every user prompt.
+Already-configured DLB MCP entry in `~/.claude.json`? You're ready. The `dlb-inbox-check` hook (wired by `dlb-mcp setup`) gives you a secondary belt-and-suspenders notification on every user prompt.
 
 ### Codex CLI
 Add this to `~/.codex/config.toml`:
