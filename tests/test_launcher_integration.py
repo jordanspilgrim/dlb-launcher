@@ -19,14 +19,11 @@ from __future__ import annotations
 import contextlib
 import os
 import select
+import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from threading import Thread
-
-import pytest
-
-from dlb_launcher.launcher import run
 
 from .conftest import insert_message
 
@@ -38,68 +35,53 @@ ECHO_CHILD = (
     "    sys.stdout.flush()\n"
 )
 
+# The launcher runs in its own process. pty.fork() must happen in a
+# single-threaded process: forking from a pytest worker thread (the old
+# approach) is unsafe and Python 3.12+ warns about it. A subprocess also
+# gives the launcher real stdin/stdout fds instead of swapped sys.std*
+# objects, so nothing in the test process closes an fd twice.
+LAUNCHER_DRIVER = (
+    "import sys\n"
+    "from dlb_launcher.launcher import run\n"
+    "sys.exit(run(cli_argv=[sys.executable, '-u', '-c', sys.argv[1]], name='alpha') or 0)\n"
+)
 
-@pytest.fixture()
-def launcher_in_thread(fake_dlb_store: Path):
-    """Run the launcher in a background thread, with stdin/stdout swapped
-    for a captured pipe pair so the test can read the relayed child output.
 
-    Returns (output_reader_fd, stop_callable).
+@contextlib.contextmanager
+def launcher_process(store: Path) -> Iterator[subprocess.Popen[bytes]]:
+    """Run the launcher wrapping ECHO_CHILD; yield the process.
+
+    Read relayed child output from `proc.stdout`. On exit, stdin is closed
+    (the launcher sees EOF and shuts down) and the process is reaped.
     """
-    # The launcher reads from sys.stdin and writes to sys.stdout. To
-    # capture what the child echoes (which the launcher writes to
-    # sys.stdout), redirect sys.stdout to a pipe we can read from.
-    captured_r, captured_w = os.pipe()
-    # We don't drive input in this test — the child only ever sees what
-    # the watcher injects. Provide a stdin that's open but never readable.
-    stdin_r, stdin_w = os.pipe()
-
-    saved_stdin = sys.stdin
-    saved_stdout = sys.stdout
-
-    sys.stdin = os.fdopen(stdin_r, "r")
-    sys.stdout = os.fdopen(captured_w, "w", buffering=1)
-
-    exit_code: list[int] = []
-
-    errors: list[BaseException] = []
-
-    def target():
+    env = {**os.environ, "DLB_STORE": str(store)}
+    proc = subprocess.Popen(
+        [sys.executable, "-c", LAUNCHER_DRIVER, ECHO_CHILD],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        yield proc
+    finally:
+        assert proc.stdin is not None
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
         try:
-            code = run(
-                cli_argv=[sys.executable, "-u", "-c", ECHO_CHILD],
-                name="alpha",
-            )
-            exit_code.append(code)
-        except BaseException as e:  # noqa: BLE001 — bubble up via list
-            errors.append(e)
-        finally:
-            with contextlib.suppress(OSError):
-                os.close(captured_w)
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5.0)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
 
-    t = Thread(target=target, daemon=True)
-    t.start()
 
-    def stop():
-        # Close the synthetic stdin so the launcher's IO loop notices EOF
-        # and exits cleanly; then restore the real stdio.
-        with contextlib.suppress(OSError):
-            os.close(stdin_w)
-        t.join(timeout=3.0)
-        sys.stdin = saved_stdin
-        sys.stdout = saved_stdout
-        with contextlib.suppress(OSError):
-            os.close(captured_r)
-
-    yield captured_r, stop, exit_code, errors
-
-    # Always tear down even if the test raises.
-    with contextlib.suppress(OSError):
-        os.close(stdin_w)
-    sys.stdin = saved_stdin
-    sys.stdout = saved_stdout
-    with contextlib.suppress(OSError):
-        os.close(captured_r)
+def _assert_alive(proc: subprocess.Popen[bytes]) -> None:
+    if proc.poll() is not None:
+        err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+        raise AssertionError(f"Launcher exited early ({proc.returncode}): {err[-2000:]}")
 
 
 def _read_for(fd: int, seconds: float) -> bytes:
@@ -123,155 +105,93 @@ def _read_for(fd: int, seconds: float) -> bytes:
     return bytes(buf)
 
 
-def test_wake_injection_reaches_child_stdin(
-    fake_dlb_store: Path,
-    launcher_in_thread,
-) -> None:
+def test_wake_injection_reaches_child_stdin(fake_dlb_store: Path) -> None:
     """The smoking-gun test: drop a message into the DLB store while the
     launcher is running, then observe the echo child relay our synthetic
-    wake prompt back through stdout — proving the injection traveled
-    launcher → PTY master → child stdin → child stdout → PTY master →
-    launcher → captured pipe.
+    wake prompt back through stdout, proving the injection traveled
+    launcher -> PTY master -> child stdin -> child stdout -> PTY master ->
+    launcher -> captured pipe.
     """
-    captured_r, stop, exit_code, errors = launcher_in_thread
-    try:
-        # Surface any launcher crash before asserting on output
-        time.sleep(0.5)
-        if errors:
-            raise AssertionError(f"Launcher thread crashed: {errors[0]!r}") from errors[0]
-        # Give the child a moment to spin up, then sit idle.
-        time.sleep(1.5)
-        # Drain any initial output (the echo child has none, but cover
-        # the general case).
-        _ = _read_for(captured_r, 0.2)
+    with launcher_process(fake_dlb_store) as proc:
+        assert proc.stdout is not None
+        out_fd = proc.stdout.fileno()
+        # Let the child spin up and the watcher take its baseline snapshot.
+        time.sleep(2.0)
+        _assert_alive(proc)
+        _ = _read_for(out_fd, 0.2)
 
-        # Post the message AFTER the launcher's initial watermark snapshot
-        # so it counts as "new" — exercises the watcher-thread poll path.
-        # The startup-surface path (pre-existing mail surfaced on launch) is
-        # covered by test_startup_surface_emits_existing_unread.
+        # Post AFTER the baseline so it counts as "new" (watcher poll path).
+        # The startup-surface path is covered separately below.
         insert_message(fake_dlb_store, recipient="alpha", sender="bravo", body="ping")
 
-        # The watcher polls every 1.5s; the idle gate is 1s; allow a
-        # generous window for both to elapse, then read what the echo
-        # child relayed.
-        out = _read_for(captured_r, 6.0)
+        out = _read_for(out_fd, 6.0)
         assert b"DLB-WAKE" in out, "Expected wake prompt to be echoed by child; got " + repr(
             out[:200]
         )
         assert b"[alpha]" in out
         assert b"bravo" in out  # sender shown
-    finally:
-        stop()
-
-
-# Note: a second integration test ("no watcher when --name is omitted")
-# was authored but caused fork/PTY state leakage that destabilized the
-# happy-path test above. The no-name case is structurally guaranteed by
-# launcher.py (the watcher thread is only spawned inside `if name:`); a
-# unit test on the launcher would need process isolation (pytest-forked
-# or similar). Skipping for v1 — covered by code inspection.
 
 
 def test_startup_surface_emits_existing_unread(fake_dlb_store: Path) -> None:
     """Mail that arrived BEFORE the launcher started must produce a wake
     prompt on launch (covers the gap between SessionStart hook fire and
     the watcher's initial baseline snapshot).
-
-    This re-implements the launcher_in_thread fixture inline so we can
-    control the ordering: insert THEN launch (the fixture launches
-    immediately and there's no way to interpose).
     """
-    # Insert FIRST — these are "pre-existing" from the launcher's POV.
     insert_message(fake_dlb_store, recipient="alpha", sender="early-bird", body="hello")
-
-    captured_r, captured_w = os.pipe()
-    stdin_r, stdin_w = os.pipe()
-
-    saved_stdin = sys.stdin
-    saved_stdout = sys.stdout
-
-    sys.stdin = os.fdopen(stdin_r, "r")
-    sys.stdout = os.fdopen(captured_w, "w", buffering=1)
-
-    errors: list[BaseException] = []
-
-    def target() -> None:
-        try:
-            run(cli_argv=[sys.executable, "-u", "-c", ECHO_CHILD], name="alpha")
-        except BaseException as e:  # noqa: BLE001
-            errors.append(e)
-        finally:
-            with contextlib.suppress(OSError):
-                os.close(captured_w)
-
-    t = Thread(target=target, daemon=True)
-    t.start()
-    try:
+    with launcher_process(fake_dlb_store) as proc:
+        assert proc.stdout is not None
         time.sleep(0.5)
-        if errors:
-            raise AssertionError(f"Launcher thread crashed: {errors[0]!r}") from errors[0]
-        # Read for up to 3s — startup-surface should fire essentially immediately
-        # (no poll interval to wait through; it's pre-watcher).
-        out = _read_for(captured_r, 3.0)
+        _assert_alive(proc)
+        out = _read_for(proc.stdout.fileno(), 3.0)
         assert b"DLB-WAKE" in out, (
             "Expected startup-surface to wake on pre-existing mail; got " + repr(out[:200])
         )
         assert b"[alpha]" in out
         assert b"early-bird" in out
-    finally:
-        with contextlib.suppress(OSError):
-            os.close(stdin_w)
-        t.join(timeout=3.0)
-        sys.stdin = saved_stdin
-        sys.stdout = saved_stdout
-        with contextlib.suppress(OSError):
-            os.close(captured_r)
 
 
 def test_startup_surface_silent_when_no_unread(fake_dlb_store: Path) -> None:
-    """No pre-existing mail → no startup-surface wake. The watcher's normal
-    poll path takes over once a real message arrives.
-
-    Asserted by checking that within a short window after launch (BEFORE
-    we insert anything), nothing matching DLB-WAKE appears on the relay.
+    """No pre-existing mail -> no startup-surface wake. Checked inside a
+    window shorter than the watcher's 1.5s poll interval.
     """
-    captured_r, captured_w = os.pipe()
-    stdin_r, stdin_w = os.pipe()
-
-    saved_stdin = sys.stdin
-    saved_stdout = sys.stdout
-
-    sys.stdin = os.fdopen(stdin_r, "r")
-    sys.stdout = os.fdopen(captured_w, "w", buffering=1)
-
-    errors: list[BaseException] = []
-
-    def target() -> None:
-        try:
-            run(cli_argv=[sys.executable, "-u", "-c", ECHO_CHILD], name="alpha")
-        except BaseException as e:  # noqa: BLE001
-            errors.append(e)
-        finally:
-            with contextlib.suppress(OSError):
-                os.close(captured_w)
-
-    t = Thread(target=target, daemon=True)
-    t.start()
-    try:
+    with launcher_process(fake_dlb_store) as proc:
+        assert proc.stdout is not None
         time.sleep(0.5)
-        if errors:
-            raise AssertionError(f"Launcher thread crashed: {errors[0]!r}") from errors[0]
-        # Short window (well under the watcher's 1.5s poll interval) so we
-        # don't accidentally catch a poll-cycle wake.
-        out = _read_for(captured_r, 1.0)
+        _assert_alive(proc)
+        out = _read_for(proc.stdout.fileno(), 1.0)
         assert b"DLB-WAKE" not in out, (
             "Did not expect a startup-surface wake when inbox is empty; got " + repr(out[:200])
         )
+
+
+def test_no_watcher_without_name(fake_dlb_store: Path) -> None:
+    """Without --name the launcher is a pure relay: pre-existing mail never
+    produces a wake. Process isolation makes this safe to test now.
+    """
+    insert_message(fake_dlb_store, recipient="alpha", sender="early-bird", body="hello")
+    env = {**os.environ, "DLB_STORE": str(fake_dlb_store)}
+    driver = LAUNCHER_DRIVER.replace("name='alpha'", "name=None")
+    proc = subprocess.Popen(
+        [sys.executable, "-c", driver, ECHO_CHILD],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        assert proc.stdout is not None
+        time.sleep(0.5)
+        _assert_alive(proc)
+        out = _read_for(proc.stdout.fileno(), 2.5)
+        assert b"DLB-WAKE" not in out
     finally:
-        with contextlib.suppress(OSError):
-            os.close(stdin_w)
-        t.join(timeout=3.0)
-        sys.stdin = saved_stdin
-        sys.stdout = saved_stdout
-        with contextlib.suppress(OSError):
-            os.close(captured_r)
+        assert proc.stdin is not None
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5.0)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
