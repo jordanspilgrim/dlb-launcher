@@ -50,11 +50,20 @@ Then, inside each session, tell the LLM to register with DLB using the **same na
 
 From this point on, when alpha sends a message to bravo (via `mcp__dlb__send`), `dlb-launcher` in bravo's terminal sees the new mail, waits for bravo to be idle, and injects a synthetic prompt. Bravo's LLM reads the inbox and processes the message. Replies travel the same path in reverse.
 
-What wakes the session, and what doesn't:
+What wakes the session, and what doesn't. The launcher detects each column it needs on the store it finds, so behavior depends on the dlb-mcp schema version:
 
-- **Work only.** Read receipts, cancelled or superseded tasks, and messages past their deadline or expiry never wake the CLI (dlb-mcp schema v9+). On older stores every new message counts, as before.
-- **Busy means later, not never.** If mail lands mid-turn, the batch stays pending and the wake fires as soon as the CLI goes idle, however long the turn runs.
-- **Heartbeat.** While running, the launcher stamps `monitor_heartbeat_ms` for its name every 30s, so `list_threads` shows the session as `wakeable`. It only updates an existing agent row; it never creates the store or registers a name.
+| Store | Never wakes | Heartbeat |
+|---|---|---|
+| v1 | Nothing is filtered: every new unread message wakes. | No |
+| v2 | Messages past `expires_at_ms`. | No |
+| v3-v8 | Expired messages and read receipts (`msg_type = 'receipt'`). | No: those stores have no `monitor_heartbeat_ms` column. |
+| v9+ | All of the above, plus cancelled or superseded tasks (`cancelled_at_ms` set) and tasks past `deadline_ms`. | Yes |
+
+- **Startup baseline.** Before the CLI starts, the launcher takes one snapshot of the inbox. Unread work already waiting gets a single wake once the CLI is idle; it never wakes twice for the same message.
+- **The watermark only moves past handled rows.** A message the launcher skipped (a receipt, a cancelled task) is passed over for good. A work message that has not been delivered yet holds the watermark back, so a late-committing row is never lost.
+- **Busy means later, not never.** If mail lands mid-turn, the batch stays pending. The launcher retries after 0.2s, doubling up to 2s between checks. It injects once the CLI has been quiet for 1s, or for 0.2s if `--prompt-marker` matches the end of its output. After 60s pending it injects anyway and logs a warning, for CLIs that repaint a spinner forever.
+- **Your typing wins.** While you have unsent input on the line, the wake is deferred, past the 60s ceiling too (logged once). Enter, Ctrl-C or Ctrl-U clears the line and the wake goes out at the next idle moment.
+- **Heartbeat (v9+ only).** The launcher stamps `monitor_heartbeat_ms` on start and then every 30s, so `list_threads` shows the session as `wakeable`. It only stamps the agents row that belongs to this session: the row whose `session_id` matches `--session-id` (or `DLB_SESSION_ID`), or, without either, the first registration of `--name` made after the launcher started. A row held by another session is skipped and logged. It never creates the store or registers a name.
 
 ## How the wake prompt looks
 
@@ -71,6 +80,8 @@ The LLM should respond by calling `mcp__dlb__read` and surfacing the message con
 | Flag | What |
 |---|---|
 | `--name <inbox>`, `-n <inbox>` | DLB inbox name to watch. Must match what the LLM inside registers as. If omitted, the launcher is a pure transparent PTY relay (no wake mechanism). |
+| `--session-id <id>` | The `DLB_SESSION_ID` the wrapped CLI's dlb-mcp server registers with. The heartbeat is only stamped on the agents row bound to this id. Defaults to `DLB_SESSION_ID` from the environment. |
+| `--prompt-marker <regex>` | Regex matched against the end of the child's recent output (ANSI codes stripped) that means the CLI is at its input prompt. When it matches, the CLI counts as idle after 0.2s of quiet instead of 1s. |
 | `--version` | Print version and exit. |
 | `<cli> [args...]` | The CLI to wrap, followed by its own arguments. Everything after `--name` (or the first non-`--name` positional) is forwarded to the child. |
 
@@ -78,6 +89,9 @@ Env vars:
 | Var | Default | What |
 |---|---|---|
 | `DLB_STORE` | `~/.dlb/store.sqlite3` | Path to DLB's SQLite store. Inherited from DLB's own convention. |
+| `DLB_SESSION_ID` | unset | Fallback for `--session-id`. |
+| `DLB_LAUNCHER_LOG` | unset | Write launcher diagnostics to this file instead of stderr. |
+| `DLB_LAUNCHER_DEBUG` | unset | Set to `1` for debug-level diagnostics. |
 
 ## Setup notes per CLI
 
