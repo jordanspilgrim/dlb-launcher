@@ -57,6 +57,26 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--session-id",
+        default=None,
+        help=(
+            "Session id the wrapped CLI's dlb-mcp server registers with "
+            "(its DLB_SESSION_ID). The heartbeat is only stamped on the agents "
+            "row bound to this id. Defaults to DLB_SESSION_ID from the "
+            "environment; without either, the launcher binds to the first "
+            "registration of --name made after it started."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-marker",
+        default=None,
+        help=(
+            "Regex (matched against the end of the child's recent output, ANSI "
+            "codes stripped) that means the CLI is at its input prompt. When it "
+            "matches, the child counts as idle after 0.2s of quiet instead of 1s."
+        ),
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"dlb-launcher {__version__}",
@@ -71,7 +91,12 @@ def main() -> int:
     if not ns.cli:
         parser.error("missing CLI command (e.g. 'claude', 'codex', 'gemini')")
 
-    return run(cli_argv=ns.cli, name=ns.name)
+    return run(
+        cli_argv=ns.cli,
+        name=ns.name,
+        session_id=ns.session_id,
+        prompt_marker=ns.prompt_marker,
+    )
 
 
 if __name__ == "__main__":
